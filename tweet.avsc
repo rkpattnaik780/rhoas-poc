@@ -1,0 +1,18 @@
+{
+  "type" : "record",
+  "name" : "Tweet",
+  "fields" : [ 
+   {
+      "name" : "user",
+      "type" : "string"
+   }, 
+   {
+      "name" : "text",
+      "type" : "string"
+   },
+   {
+     "name" : "createdAt",
+     "type" : "string"
+   } 
+  ]
+}
