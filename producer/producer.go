@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -8,11 +10,15 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/kafka"
+	// "github.com/confluentinc/confluent-kafka-go/kafka"
+
 	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
 	"github.com/riferrei/srclient"
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl/plain"
 	"github.com/spf13/viper"
 )
 
@@ -43,7 +49,7 @@ func main() {
 	schemaPath := viper.Get("SCHEMA_FILE_PATH").(string)
 
 	schemaRegistryClient := srclient.CreateSchemaRegistryClient(registryUrl)
-	schemaRegistryClient.SetCredentials(clientID, clientSecret)
+	// schemaRegistryClient.SetCredentials(clientID, clientSecret)
 
 	schema, err := schemaRegistryClient.GetLatestSchema(topicName)
 	if err != nil {
@@ -58,14 +64,36 @@ func main() {
 		}
 	}
 
-	producer, err := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": bootstrapServer,
-		"acks":              "all",
-		"security.protocol": "SASL_SSL",
-		"sasl.mechanisms":   "PLAIN",
-		"sasl.username":     clientID,
-		"sasl.password":     clientSecret,
+	mech := plain.Mechanism{
+		Username: clientID,
+		Password: clientSecret,
+	}
+
+	d := &kafka.Dialer{
+		ClientID:      clientID,
+		Timeout:       10 * time.Second,
+		DualStack:     true,
+		SASLMechanism: &mech,
+		TLS:           &tls.Config{},
+	}
+
+	w := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:  []string{bootstrapServer.(string)},
+		Topic:    topicName,
+		Balancer: &kafka.Hash{},
+		Dialer:   d,
 	})
+
+	defer w.Close()
+
+	// producer, err := kafka.NewProducer(&kafka.ConfigMap{
+	// 	"bootstrap.servers": bootstrapServer,
+	// 	"acks":              "all",
+	// 	"security.protocol": "SASL_SSL",
+	// 	"sasl.mechanisms":   "PLAIN",
+	// 	"sasl.username":     clientID,
+	// 	"sasl.password":     clientSecret,
+	// })
 
 	config := oauth1.NewConfig(consumerKey, consumerSecret)
 	token := oauth1.NewToken(accessToken, accessSecret)
@@ -111,16 +139,21 @@ func main() {
 		var recordValue []byte
 		recordValue = append(recordValue, valueBytes...)
 
-		deliveryChan := make(chan kafka.Event)
+		fmt.Println("after ll manual validations")
 
-		err = producer.Produce(&kafka.Message{
-			TopicPartition: kafka.TopicPartition{Topic: &topicName},
-			Value:          recordValue,
-		}, deliveryChan)
+		err = w.WriteMessages(context.Background(),
+			kafka.Message{
+				Value: recordValue,
+			},
+		)
 
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("failed to write messages: ", err)
 		}
+
+		// if err != nil {
+		// 	log.Fatal(err)
+		// }
 	}
 
 	go demux.HandleChan(stream.Messages)
