@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/joho/godotenv"
 	"github.com/riferrei/srclient"
-	"github.com/spf13/viper"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -19,42 +19,45 @@ import (
 
 func main() {
 
-	viper.SetConfigFile(".env")
-	viper.ReadInConfig()
+	// load .env files that hold configurations MongoDB, Twitter and Managed Services
+	err := godotenv.Load("../.env", "../rhoas.env")
+	if err != nil {
+		log.Fatal(err.Error())
+	}
 
-	mongoURI := viper.Get("MONGO_URI").(string)
-
+	// Configuring a client to connect to the MongoDB instance
+	mongoURI := os.Getenv("MONGO_URI")
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
-
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	serverAPIOptions := options.ServerAPI(options.ServerAPIVersion1)
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI).SetServerAPIOptions(serverAPIOptions))
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	defer client.Disconnect(ctx)
-	err = client.Ping(ctx, readpref.Primary())
-	if err != nil {
-		log.Fatal(err)
-	}
-	databases, err := client.ListDatabaseNames(ctx, bson.M{})
-	if err != nil {
+
+	// Execute a ping command to verify that the client can connect to the deployment
+	if err = client.Ping(ctx, readpref.Primary()); err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println("databases", databases)
+	// Parsing the environment variables from the .env files
+	bootstrapServer := os.Getenv("KAFKA_HOST")
+	registryUrl := os.Getenv("SERVICE_REGISTRY_URL")
+	compatPath := os.Getenv("SERVICE_REGISTRY_COMPAT_PATH")
 
-	bootstrapServer := viper.Get("BOOTSTRAP_SERVER")
-	registryUrl := viper.Get("REGISTRY_URL").(string)
+	registryAPIEndPoint := fmt.Sprintf("%s%s", registryUrl, compatPath)
 
-	topicName := viper.Get("TOPIC").(string)
+	topicName := os.Getenv("TOPIC")
 
-	clientID := viper.Get("SASL_USERNAME").(string)
-	clientSecret := viper.Get("SASL_PASSWORD").(string)
+	clientID := os.Getenv("RHOAS_CLIENT_ID")
 
-	dbName := viper.Get("MONGO_DATABASE").(string)
-	dbCollection := viper.Get("MONGO_COLLECTION").(string)
+	clientSecret := os.Getenv("RHOAS_CLIENT_SECRET")
 
+	dbName := os.Getenv("MONGO_DATABASE")
+	dbCollection := os.Getenv("MONGO_COLLECTION")
+
+	// Initialize a Kafka consumer to read messages from a Kafka topic
 	consumer, newErr := kafka.NewConsumer(&kafka.ConfigMap{
 		"bootstrap.servers": bootstrapServer,
 		"group.id":          "poc-group-2",
@@ -70,6 +73,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Subscribe to the topic
 	err = consumer.SubscribeTopics([]string{topicName}, nil)
 	if err != nil {
 		log.Fatal(err)
@@ -77,9 +81,8 @@ func main() {
 
 	collection := client.Database(dbName).Collection(dbCollection)
 
-	fmt.Println("after collection statement")
-
-	schemaRegistryClient := srclient.CreateSchemaRegistryClient(registryUrl)
+	// Creating a new client to interact with the Service Registry instance and fetch schema/artifact
+	schemaRegistryClient := srclient.CreateSchemaRegistryClient(registryAPIEndPoint)
 	schemaRegistryClient.SetCredentials(clientID, clientSecret)
 
 	schema, err := schemaRegistryClient.GetLatestSchema(topicName)
@@ -88,20 +91,23 @@ func main() {
 	}
 
 	for {
+
+		// Poll the consumer for messages
 		message, err := consumer.ReadMessage(1000 * time.Millisecond)
 		if err != nil {
 			fmt.Println(err.Error())
 		}
 		if err == nil {
-
-			fmt.Println("message value - ", string(message.Value))
 			var tweetJSON map[string]interface{}
 
+			// convert data in bytes to Go native data type
+			// in accordance with the Avro schema supplied
 			native, _, _ := schema.Codec().NativeFromBinary(message.Value)
+
+			// Converts Go native data type to Avro in JSON text format
+			// in accordance with the Avro schema supplied
 			value, _ := schema.Codec().TextualFromNative(nil, native)
-			fmt.Printf("Here is the message %s\n", string(value))
 			json.Unmarshal(value, &tweetJSON)
-			fmt.Println("tweet json:", tweetJSON)
 
 			tweetRecord := bson.M{
 				"user":      tweetJSON["user"],
@@ -109,12 +115,15 @@ func main() {
 				"createdAt": tweetJSON["createdAt"],
 			}
 
+			// insert tweet into the collection.
 			res, err := collection.InsertOne(ctx, tweetRecord)
 			if err != nil {
 				log.Fatal(err)
 			}
+
+			// Log the ID of the object created for the tweet
 			id := res.InsertedID
-			fmt.Println(id)
+			fmt.Println("tweet inserted with ID: ", id)
 		}
 	}
 
